@@ -2,6 +2,8 @@
 
 #include "SDL_compat.h"
 
+#include <Limelight.h>
+
 class StreamUtils
 {
 public:
@@ -25,6 +27,9 @@ public:
 
     static
     int getDisplayRefreshRate(SDL_Window* window);
+
+    static
+    bool getDisplayHdrCapabilities(int displayIndex, PSS_HDR_METADATA metadata);
 
     static
     bool hasFastAes();

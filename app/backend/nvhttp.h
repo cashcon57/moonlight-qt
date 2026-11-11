@@ -170,6 +170,7 @@ public:
              bool localAudio,
              int gamepadMask,
              bool persistGameControllersOnDisconnect,
+             PSS_HDR_METADATA displayHdrCapabilities,
              QString& rtspSessionUrl);
 
     QVector<NvApp>

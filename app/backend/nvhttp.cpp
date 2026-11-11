@@ -205,12 +205,23 @@ NvHTTP::startApp(QString verb,
                  bool localAudio,
                  int gamepadMask,
                  bool persistGameControllersOnDisconnect,
+                 PSS_HDR_METADATA displayHdrCapabilities,
                  QString& rtspSessionUrl)
 {
     int riKeyId;
 
     memcpy(&riKeyId, streamConfig->remoteInputAesIv, sizeof(riKeyId));
     riKeyId = qFromBigEndian(riKeyId);
+
+    // The display_data fields of NVAPI's NV_HDR_CAPABILITIES struct, where zero means unknown
+    QString hdrCapDisplayData = QString("%1x%2x%3x%4x%5x%6x%7x%8x%9x%10x%11")
+            .arg(displayHdrCapabilities->displayPrimaries[0].x).arg(displayHdrCapabilities->displayPrimaries[0].y)
+            .arg(displayHdrCapabilities->displayPrimaries[1].x).arg(displayHdrCapabilities->displayPrimaries[1].y)
+            .arg(displayHdrCapabilities->displayPrimaries[2].x).arg(displayHdrCapabilities->displayPrimaries[2].y)
+            .arg(displayHdrCapabilities->whitePoint.x).arg(displayHdrCapabilities->whitePoint.y)
+            .arg(displayHdrCapabilities->maxDisplayLuminance)
+            .arg(displayHdrCapabilities->minDisplayLuminance)
+            .arg(displayHdrCapabilities->maxFullFrameLuminance);
 
     QString response =
             openConnectionToString(m_BaseUrlHttps,
@@ -227,7 +238,7 @@ NvHTTP::startApp(QString verb,
                                    "&rikey="+QByteArray(streamConfig->remoteInputAesKey, sizeof(streamConfig->remoteInputAesKey)).toHex()+
                                    "&rikeyid="+QString::number(riKeyId)+
                                    ((streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) ?
-                                       "&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0" :
+                                       "&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData="+hdrCapDisplayData :
                                         "")+
                                    "&localAudioPlayMode="+QString::number(localAudio ? 1 : 0)+
                                    "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration))+

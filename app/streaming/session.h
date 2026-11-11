@@ -162,6 +162,8 @@ private:
 
     int getAudioRendererCapabilities(int audioConfiguration);
 
+    int getStreamDisplayIndex();
+
     void getWindowDimensions(int& x, int& y,
                              int& width, int& height);
 
@@ -247,6 +249,7 @@ private:
     bool m_IsFullScreen;
     SupportedVideoFormatList m_SupportedVideoFormats; // Sorted in order of descending priority
     STREAM_CONFIGURATION m_StreamConfig;
+    SS_HDR_METADATA m_DisplayHdrCapabilities;
     DECODER_RENDERER_CALLBACKS m_VideoCallbacks;
     AUDIO_RENDERER_CALLBACKS m_AudioCallbacks;
     NvComputer* m_Computer;

@@ -2,6 +2,7 @@
 
 #include <Qt>
 #include <QDir>
+#include <QFile>
 
 #ifdef Q_OS_DARWIN
 #include <ApplicationServices/ApplicationServices.h>
@@ -9,6 +10,8 @@
 
 #ifdef Q_OS_WINDOWS
 #include <Windows.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
 #endif
 
 #ifdef Q_OS_UNIX
@@ -203,6 +206,247 @@ int StreamUtils::getDisplayRefreshRate(SDL_Window* window)
     }
 
     return mode.refresh_rate;
+}
+
+#if defined(Q_OS_WINDOWS)
+
+static uint16_t clampToUint16(float value)
+{
+    return (uint16_t)SDL_clamp(value + 0.5f, 0.0f, 65535.0f);
+}
+
+static bool getDxgiHdrCapabilities(int displayIndex, PSS_HDR_METADATA metadata, QString& source)
+{
+    int adapterIndex, outputIndex;
+    if (!SDL_DXGIGetOutputInfo(displayIndex, &adapterIndex, &outputIndex)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "SDL_DXGIGetOutputInfo() failed: %s",
+                     SDL_GetError());
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    Microsoft::WRL::ComPtr<IDXGIOutput> output;
+    Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
+    DXGI_OUTPUT_DESC1 desc;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (SUCCEEDED(hr)) {
+        hr = factory->EnumAdapters1(adapterIndex, &adapter);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = adapter->EnumOutputs(outputIndex, &output);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = output.As(&output6);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = output6->GetDesc1(&desc);
+    }
+    if (FAILED(hr)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Unable to get DXGI_OUTPUT_DESC1: %x",
+                    hr);
+        return false;
+    }
+
+    // Chromaticity coordinates are normalized to 50,000
+    const FLOAT* primaries[] = { desc.RedPrimary, desc.GreenPrimary, desc.BluePrimary };
+    for (int i = 0; i < 3; i++) {
+        metadata->displayPrimaries[i].x = clampToUint16(primaries[i][0] * 50000);
+        metadata->displayPrimaries[i].y = clampToUint16(primaries[i][1] * 50000);
+    }
+    metadata->whitePoint.x = clampToUint16(desc.WhitePoint[0] * 50000);
+    metadata->whitePoint.y = clampToUint16(desc.WhitePoint[1] * 50000);
+
+    metadata->maxDisplayLuminance = clampToUint16(desc.MaxLuminance);
+    metadata->minDisplayLuminance = clampToUint16(desc.MinLuminance * 10000);
+    metadata->maxFullFrameLuminance = clampToUint16(desc.MaxFullFrameLuminance);
+
+    source = "DXGI";
+    return true;
+}
+
+#elif defined(Q_OS_LINUX)
+
+static bool isEdidBlockValid(const QByteArray& edid, int offset)
+{
+    if (edid.size() < offset + 128) {
+        return false;
+    }
+
+    uint8_t sum = 0;
+    for (int i = 0; i < 128; i++) {
+        sum += (uint8_t)edid[offset + i];
+    }
+    return sum == 0;
+}
+
+static QByteArray getEdidMonitorName(const QByteArray& edid)
+{
+    if (!isEdidBlockValid(edid, 0)) {
+        return QByteArray();
+    }
+
+    // Look for a Display Product Name descriptor (tag 0xFC) in the base block
+    for (int offset = 54; offset <= 108; offset += 18) {
+        const uint8_t* desc = (const uint8_t*)edid.constData() + offset;
+        if (desc[0] == 0 && desc[1] == 0 && desc[2] == 0 && desc[3] == 0xFC) {
+            return QByteArray((const char*)&desc[5], 13).split('\n').first().trimmed();
+        }
+    }
+
+    return QByteArray();
+}
+
+static bool parseEdidHdrCapabilities(const QByteArray& edid, PSS_HDR_METADATA metadata)
+{
+    static const char header[] = { 0x00, '\xFF', '\xFF', '\xFF', '\xFF', '\xFF', '\xFF', 0x00 };
+    if (!isEdidBlockValid(edid, 0) || !edid.startsWith(QByteArray::fromRawData(header, sizeof(header)))) {
+        return false;
+    }
+
+    // The base block has 10-bit chromaticity coordinates (normalized to 1024) at offset 25:
+    // the low bits of red and green, the low bits of blue and white, then the high bits of
+    // Rx, Ry, Gx, Gy, Bx, By, Wx, and Wy.
+    const uint8_t* e = (const uint8_t*)edid.constData();
+    uint16_t xy[8];
+    for (int i = 0; i < 8; i++) {
+        uint16_t value = (e[27 + i] << 2) | ((e[25 + i / 4] >> (6 - 2 * (i % 4))) & 0x3);
+        xy[i] = (uint16_t)((value * 50000 + 512) / 1024);
+    }
+    for (int i = 0; i < 3; i++) {
+        metadata->displayPrimaries[i].x = xy[i * 2];
+        metadata->displayPrimaries[i].y = xy[i * 2 + 1];
+    }
+    metadata->whitePoint.x = xy[6];
+    metadata->whitePoint.y = xy[7];
+
+    // Look for the HDR Static Metadata Data Block (CTA-861.3) in the CTA extension blocks
+    for (int ext = 1; ext <= e[126] && isEdidBlockValid(edid, ext * 128); ext++) {
+        const uint8_t* cta = e + ext * 128;
+        if (cta[0] != 0x02 || cta[2] < 4 || cta[2] > 127) {
+            continue;
+        }
+
+        for (int i = 4; i < cta[2]; i += (cta[i] & 0x1F) + 1) {
+            int length = cta[i] & 0x1F;
+
+            // Extended tag (7) with extended tag code 6, Static Metadata Type 1 support,
+            // and at least the max luminance field present
+            if ((cta[i] >> 5) != 7 || length < 4 || i + length >= cta[2] ||
+                    cta[i + 1] != 6 || !(cta[i + 3] & 0x1)) {
+                continue;
+            }
+
+            // Luminance is 50 * 2^(CV / 32) nits, and code values of 0 mean the
+            // display didn't provide that value
+            auto luminance = [](uint8_t codeValue) {
+                return codeValue != 0 ? 50.0 * SDL_pow(2.0, codeValue / 32.0) : 0.0;
+            };
+            double maxLuminance = luminance(cta[i + 4]);
+            metadata->maxDisplayLuminance = (uint16_t)SDL_lround(maxLuminance);
+            if (length >= 5) {
+                metadata->maxFullFrameLuminance = (uint16_t)SDL_lround(luminance(cta[i + 5]));
+            }
+            if (length >= 6) {
+                // Minimum luminance is max * (CV / 255)^2 / 100 nits, in 1/10000th of a nit
+                double minLuminance = maxLuminance * SDL_pow(cta[i + 6] / 255.0, 2) / 100;
+                metadata->minDisplayLuminance = (uint16_t)SDL_min(SDL_lround(minLuminance * 10000), 65535L);
+            }
+            return true;
+        }
+    }
+
+    return true;
+}
+
+static bool getEdidHdrCapabilities(int displayIndex, PSS_HDR_METADATA metadata, QString& source)
+{
+    // Find the connected DRM connectors. The EDID is world-readable in sysfs, and this
+    // works whether we're running under X11, Wayland, or directly on KMSDRM.
+    QDir drmDir("/sys/class/drm");
+    QList<QPair<QString, QByteArray>> connectors;
+    for (const QString& name : drmDir.entryList(QStringList("card*-*"), QDir::Dirs | QDir::NoDotAndDotDot)) {
+        QFile status(drmDir.filePath(name + "/status"));
+        QFile edid(drmDir.filePath(name + "/edid"));
+        if (status.open(QIODevice::ReadOnly) && status.readAll().trimmed() == "connected" &&
+                edid.open(QIODevice::ReadOnly)) {
+            QByteArray edidData = edid.readAll();
+            if (!edidData.isEmpty()) {
+                connectors.append(qMakePair(name, edidData));
+            }
+        }
+    }
+
+    // If there are multiple displays, we must be able to identify the one we're using
+    // by its connector name (e.g. "HDMI-A-1") or EDID product name.
+    if (connectors.size() > 1) {
+        QByteArray displayName = SDL_GetDisplayName(displayIndex);
+        QList<QPair<QString, QByteArray>> matches;
+        for (const auto& connector : std::as_const(connectors)) {
+            QByteArray connectorName = connector.first.section('-', 1).toUtf8();
+            QByteArray monitorName = getEdidMonitorName(connector.second);
+            if (!displayName.isEmpty() &&
+                    (displayName.contains(connectorName) || (!monitorName.isEmpty() && displayName.contains(monitorName)))) {
+                matches.append(connector);
+            }
+        }
+
+        if (matches.size() != 1) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Unable to find the DRM connector for display '%s' (%d connected, %d matches)",
+                        displayName.constData(), (int)connectors.size(), (int)matches.size());
+            return false;
+        }
+        connectors = matches;
+    }
+
+    if (connectors.size() != 1 || !parseEdidHdrCapabilities(connectors.first().second, metadata)) {
+        return false;
+    }
+
+    source = "EDID of " + connectors.first().first;
+    return true;
+}
+
+#endif
+
+bool StreamUtils::getDisplayHdrCapabilities(int displayIndex, PSS_HDR_METADATA metadata)
+{
+    bool ret = false;
+    QString source;
+
+    SDL_zerop(metadata);
+
+#if defined(Q_OS_WINDOWS)
+    ret = getDxgiHdrCapabilities(displayIndex, metadata, source);
+#elif defined(Q_OS_LINUX)
+    ret = getEdidHdrCapabilities(displayIndex, metadata, source);
+#else
+    Q_UNUSED(displayIndex);
+#endif
+
+    if (!ret) {
+        // Unknown values are sent as zeros
+        SDL_zerop(metadata);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Display HDR capabilities are unavailable");
+        return false;
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Display HDR capabilities from %s: R(%.4f, %.4f) G(%.4f, %.4f) B(%.4f, %.4f) W(%.4f, %.4f) "
+                "max %u nits, min %.4f nits, max full-frame %u nits",
+                qPrintable(source),
+                metadata->displayPrimaries[0].x / 50000.0, metadata->displayPrimaries[0].y / 50000.0,
+                metadata->displayPrimaries[1].x / 50000.0, metadata->displayPrimaries[1].y / 50000.0,
+                metadata->displayPrimaries[2].x / 50000.0, metadata->displayPrimaries[2].y / 50000.0,
+                metadata->whitePoint.x / 50000.0, metadata->whitePoint.y / 50000.0,
+                metadata->maxDisplayLuminance,
+                metadata->minDisplayLuminance / 10000.0,
+                metadata->maxFullFrameLuminance);
+    return true;
 }
 
 bool StreamUtils::hasFastAes()

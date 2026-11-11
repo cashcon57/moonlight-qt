@@ -1314,8 +1314,7 @@ private:
     Session* m_Session;
 };
 
-void Session::getWindowDimensions(int& x, int& y,
-                                  int& width, int& height)
+int Session::getStreamDisplayIndex()
 {
     int displayIndex = 0;
 
@@ -1361,6 +1360,14 @@ void Session::getWindowDimensions(int& x, int& y,
             }
         }
     }
+
+    return displayIndex;
+}
+
+void Session::getWindowDimensions(int& x, int& y,
+                                  int& width, int& height)
+{
+    int displayIndex = getStreamDisplayIndex();
 
     // Get the usable display bounds
     SDL_Rect usableBounds;
@@ -1631,6 +1638,7 @@ bool Session::startConnectionAsync()
                       m_Preferences->playAudioOnHost,
                       m_InputHandler->getAttachedGamepadMask(),
                       !m_Preferences->multiController,
+                      &m_DisplayHdrCapabilities,
                       rtspSessionUrl);
     } catch (const GfeHttpResponseException& e) {
         emit displayLaunchError(tr("Host returned error: %1").arg(e.toQString()));
@@ -1770,6 +1778,13 @@ void Session::start()
     // Initialize the gamepad code with our preferences
     // NB: m_InputHandler must be initialize before starting the connection.
     m_InputHandler = new SdlInputHandler(*m_Preferences, m_StreamConfig.width, m_StreamConfig.height);
+
+    // Tell the host about the HDR capabilities of the display we will stream on.
+    // This must happen here on the main thread before we start the connection.
+    SDL_zero(m_DisplayHdrCapabilities);
+    if (m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) {
+        StreamUtils::getDisplayHdrCapabilities(getStreamDisplayIndex(), &m_DisplayHdrCapabilities);
+    }
 
     // Kick off the async connection thread then return to the caller to pump the event loop
     auto thread = new AsyncConnectionStartThread(this);
